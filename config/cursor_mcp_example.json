@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "ty-context-engine": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "D:/PythonProjectAll/mcp-ty",
+        "run",
+        "mcp-ty"
+      ]
+    }
+  }
+}
+
