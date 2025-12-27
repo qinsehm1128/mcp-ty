@@ -1,9 +1,8 @@
 """
-MCP Server implementation powered by ty type checker.
-
-Provides semantic code analysis tools through the Model Context Protocol.
+MCP Server powered by ty type checker for semantic Python code analysis.
 """
 
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -13,6 +12,21 @@ from mcp.server.fastmcp import FastMCP
 from .lsp_client import (
     TyLspClient, Location, Diagnostic, WorkspaceEdit, TextEdit, CodeAction
 )
+
+
+def _ok(data: Any = None) -> str:
+    """Return success JSON response."""
+    return json.dumps({"status": "ok", "data": data}, ensure_ascii=False)
+
+
+def _error(message: str) -> str:
+    """Return error JSON response."""
+    return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
+
+
+def _not_found(message: str) -> str:
+    """Return not found JSON response."""
+    return json.dumps({"status": "not_found", "message": message}, ensure_ascii=False)
 
 # Configure logging
 logging.basicConfig(
@@ -24,8 +38,7 @@ logger = logging.getLogger(__name__)
 # Create the MCP server
 mcp = FastMCP(
     name="ty-context-engine",
-    instructions="Semantic Python code analysis powered by ty type checker. "
-    "Call start_project first to initialize a project, then use other tools for code analysis."
+    instructions="Python semantic analysis via ty. Call start_project first."
 )
 
 # Global LSP client instance
@@ -123,7 +136,7 @@ def _format_workspace_edit(edit: WorkspaceEdit) -> list[str]:
 def _get_client() -> TyLspClient:
     """Get the active LSP client or raise an error."""
     if _lsp_client is None or not _lsp_client.is_initialized:
-        raise RuntimeError("NOT_INITIALIZED: Call start_project(path) first")
+        raise RuntimeError("Project not initialized. Call start_project first.")
     return _lsp_client
 
 
@@ -131,22 +144,14 @@ def _get_client() -> TyLspClient:
 
 @mcp.tool()
 async def start_project(project_path: str) -> str:
-    """
-    Initialize ty type checker for a Python project. Must be called first.
-
-    Args:
-        project_path: Absolute path to project root directory.
-
-    Returns:
-        Status and available tools.
-    """
+    """Initialize ty for a Python project. Must be called first."""
     global _lsp_client
 
     path = Path(project_path).resolve()
     if not path.exists():
-        return f"ERROR: Path not found: {project_path}"
+        return _error(f"Path not found: {project_path}")
     if not path.is_dir():
-        return f"ERROR: Not a directory: {project_path}"
+        return _error(f"Not a directory: {project_path}")
 
     if _lsp_client is not None:
         try:
@@ -157,125 +162,88 @@ async def start_project(project_path: str) -> str:
     try:
         _lsp_client = TyLspClient()
         await _lsp_client.start(path)
-        return f"""OK: Project initialized
-path: {path}
-
-Available tools:
-- search_symbol(query) : Search symbols by keyword
-- list_file_symbols(file) : List symbols in file
-- read_code(file, start, end) : Read file content by line range
-- read_context(file, line, context) : Read code around a line
-- get_definition(file, line, col) : Go to definition
-- find_usages(file, line, col) : Find all references
-- get_type_info(file, line, col) : Get type information
-- analyze_file(file) : Analyze file for errors
-- get_diagnostics(file) : Get type errors
-- safe_rename(file, line, col, new_name) : Rename symbol
-- get_code_actions(file, line, col) : Get quick fixes"""
+        return _ok({"path": str(path), "initialized": True})
     except Exception as e:
         _lsp_client = None
         logger.exception("Failed to start ty server")
-        return f"ERROR: {e}"
+        return _error(str(e))
 
 
 @mcp.tool()
 async def search_symbol(query: str) -> str:
-    """
-    Search symbols (classes, functions, variables) across the project.
-    Semantic search - only matches code symbols, not comments/strings.
-
-    Args:
-        query: Symbol name or partial name (e.g., "User", "cache", "get_")
-
-    Returns:
-        Matching symbols with file:line:col and type.
-    """
+    """Search symbols (classes, functions, variables) across the project."""
     client = _get_client()
 
     try:
         symbols = await client.search_workspace_symbols(query)
 
         if not symbols:
-            return f"NO_RESULTS: '{query}'"
+            return _not_found(f"No symbols matching '{query}'")
 
-        results = [f"FOUND: {len(symbols)} symbols matching '{query}'", ""]
-
-        by_file: dict[str, list[dict]] = {}
+        results = []
         for sym in symbols:
             uri = sym.get("location", {}).get("uri", "")
-            by_file.setdefault(uri, []).append(sym)
-
-        for uri, syms in by_file.items():
             path = _uri_to_path(uri)
-            for sym in syms:
-                name = sym.get("name", "?")
-                kind = SYMBOL_KINDS.get(sym.get("kind", 0), "Symbol")
-                range_info = sym.get("location", {}).get(
-                    "range", {}).get("start", {})
-                line = range_info.get("line", 0) + 1
-                col = range_info.get("character", 0) + 1
-                container = sym.get("containerName", "")
-                container_str = f" in {container}" if container else ""
-                results.append(
-                    f"{path.name}:{line}:{col} {kind} {name}{container_str}")
+            name = sym.get("name", "?")
+            kind = SYMBOL_KINDS.get(sym.get("kind", 0), "Symbol")
+            range_info = sym.get("location", {}).get("range", {}).get("start", {})
+            line = range_info.get("line", 0) + 1
+            col = range_info.get("character", 0) + 1
+            container = sym.get("containerName", "")
+            results.append({
+                "name": name,
+                "kind": kind,
+                "file": path.name,
+                "path": str(path),
+                "line": line,
+                "column": col,
+                "container": container or None
+            })
 
-        return "\n".join(results)
+        return _ok({"query": query, "count": len(results), "symbols": results})
 
     except Exception as e:
-        return f"ERROR: {e}"
+        return _error(str(e))
 
 
 @mcp.tool()
 async def list_file_symbols(file_path: str) -> str:
-    """
-    List all symbols defined in a file (classes, functions, variables).
-
-    Args:
-        file_path: Absolute path to Python file.
-
-    Returns:
-        Symbol structure with line numbers.
-    """
+    """List all symbols defined in a file."""
     client = _get_client()
 
     path = Path(file_path).resolve()
     if not path.exists():
-        return f"ERROR: File not found: {file_path}"
+        return _error(f"File not found: {file_path}")
 
     try:
         await client.open_document(path)
         symbols = await client.search_document_symbols(path)
 
         if not symbols:
-            return f"NO_SYMBOLS: {path.name}"
+            return _not_found(f"No symbols in {path.name}")
 
-        def format_symbol(sym: dict, indent: int = 0) -> list[str]:
-            lines = []
-            prefix = "  " * indent
+        def parse_symbol(sym: dict) -> dict:
             name = sym.get("name", "?")
             kind = SYMBOL_KINDS.get(sym.get("kind", 0), "Symbol")
 
             if "range" in sym:
                 range_info = sym.get("range", {}).get("start", {})
             else:
-                range_info = sym.get("location", {}).get(
-                    "range", {}).get("start", {})
+                range_info = sym.get("location", {}).get("range", {}).get("start", {})
 
             line = range_info.get("line", 0) + 1
-            lines.append(f"{prefix}L{line} {kind} {name}")
+            children = [parse_symbol(c) for c in sym.get("children", [])]
 
-            for child in sym.get("children", []):
-                lines.extend(format_symbol(child, indent + 1))
-            return lines
+            result = {"name": name, "kind": kind, "line": line}
+            if children:
+                result["children"] = children
+            return result
 
-        results = [f"FILE: {path.name}", f"SYMBOLS: {len(symbols)}", ""]
-        for sym in symbols:
-            results.extend(format_symbol(sym))
-
-        return "\n".join(results)
+        parsed = [parse_symbol(sym) for sym in symbols]
+        return _ok({"file": path.name, "path": str(path), "count": len(symbols), "symbols": parsed})
 
     except Exception as e:
-        return f"ERROR: {e}"
+        return _error(str(e))
 
 
 @mcp.tool()
@@ -284,59 +252,40 @@ async def read_code(
     start_line: int | None = None,
     end_line: int | None = None
 ) -> str:
-    """
-    Read file content, optionally by line range.
-
-    Args:
-        file_path: Absolute path to file.
-        start_line: Start line (1-based, inclusive). None = from beginning.
-        end_line: End line (1-based, inclusive). None = to end.
-
-    Returns:
-        File content with line numbers.
-
-    Examples:
-        read_code("file.py") - Read entire file
-        read_code("file.py", 10, 20) - Read lines 10-20
-        read_code("file.py", 50) - Read from line 50 to end
-    """
+    """Read file content, optionally by line range (1-based)."""
     path = Path(file_path).resolve()
     if not path.exists():
-        return f"ERROR: File not found: {file_path}"
+        return _error(f"File not found: {file_path}")
 
     try:
         content = path.read_text(encoding="utf-8")
         lines = content.splitlines()
         total_lines = len(lines)
 
-        # Default range
-        start = (start_line or 1) - 1  # Convert to 0-based
+        start = (start_line or 1) - 1
         end = end_line or total_lines
 
-        # Validate range
         if start < 0:
             start = 0
         if end > total_lines:
             end = total_lines
         if start >= total_lines:
-            return f"ERROR: start_line {start_line} exceeds file length {total_lines}"
+            return _error(f"start_line {start_line} exceeds file length {total_lines}")
 
-        selected_lines = lines[start:end]
+        selected = {i + 1: lines[i] for i in range(start, end)}
 
-        # Format with line numbers
-        result = [f"FILE: {path.name}"]
-        result.append(f"LINES: {start + 1}-{end} of {total_lines}")
-        result.append("")
-
-        for i, line in enumerate(selected_lines, start=start + 1):
-            result.append(f"{i:4d}| {line}")
-
-        return "\n".join(result)
+        return _ok({
+            "file": path.name,
+            "path": str(path),
+            "range": {"start": start + 1, "end": end},
+            "total_lines": total_lines,
+            "lines": selected
+        })
 
     except UnicodeDecodeError:
-        return f"ERROR: Cannot read file (not UTF-8): {file_path}"
+        return _error(f"Cannot read file (not UTF-8): {file_path}")
     except Exception as e:
-        return f"ERROR: {e}"
+        return _error(str(e))
 
 
 @mcp.tool()
@@ -345,20 +294,10 @@ async def read_context(
     line: int,
     context: int = 10
 ) -> str:
-    """
-    Read code around a specific line (useful after search_symbol or get_definition).
-
-    Args:
-        file_path: Absolute path to file.
-        line: Target line number (1-based).
-        context: Number of lines before and after (default 10).
-
-    Returns:
-        Code snippet centered on the target line.
-    """
+    """Read code around a specific line with context."""
     path = Path(file_path).resolve()
     if not path.exists():
-        return f"ERROR: File not found: {file_path}"
+        return _error(f"File not found: {file_path}")
 
     try:
         content = path.read_text(encoding="utf-8")
@@ -366,168 +305,141 @@ async def read_context(
         total_lines = len(lines)
 
         if line < 1 or line > total_lines:
-            return f"ERROR: Line {line} out of range (1-{total_lines})"
+            return _error(f"Line {line} out of range (1-{total_lines})")
 
         start = max(0, line - 1 - context)
         end = min(total_lines, line + context)
 
-        result = [f"FILE: {path.name}"]
-        result.append(f"TARGET: L{line}")
-        result.append(f"CONTEXT: L{start + 1}-{end} of {total_lines}")
-        result.append("")
+        selected = {i + 1: lines[i] for i in range(start, end)}
 
-        for i in range(start, end):
-            marker = ">>>" if i == line - 1 else "   "
-            result.append(f"{marker} {i + 1:4d}| {lines[i]}")
-
-        return "\n".join(result)
+        return _ok({
+            "file": path.name,
+            "path": str(path),
+            "target_line": line,
+            "range": {"start": start + 1, "end": end},
+            "total_lines": total_lines,
+            "lines": selected
+        })
 
     except UnicodeDecodeError:
-        return f"ERROR: Cannot read file (not UTF-8): {file_path}"
+        return _error(f"Cannot read file (not UTF-8): {file_path}")
     except Exception as e:
-        return f"ERROR: {e}"
+        return _error(str(e))
 
 
 @mcp.tool()
 async def stop_project() -> str:
-    """Stop ty type checker and release resources."""
+    """Stop ty and release resources."""
     global _lsp_client
 
     if _lsp_client is None:
-        return "OK: No active project"
+        return _ok({"stopped": True, "message": "No active project"})
 
     try:
         await _lsp_client.stop()
         _lsp_client = None
-        return "OK: Project stopped"
+        return _ok({"stopped": True})
     except Exception as e:
-        return f"ERROR: {e}"
+        return _error(str(e))
 
 
 @mcp.tool()
 async def get_definition(file_path: str, line: int, column: int) -> str:
-    """
-    Go to definition of symbol at position. Semantic lookup, not text search.
-
-    Args:
-        file_path: Absolute path to Python file.
-        line: Line number (1-based).
-        column: Column number (1-based).
-
-    Returns:
-        Definition location(s).
-    """
+    """Go to definition of symbol at position (1-based)."""
     client = _get_client()
 
     path = Path(file_path).resolve()
     if not path.exists():
-        return f"ERROR: File not found: {file_path}"
+        return _error(f"File not found: {file_path}")
 
     try:
         await client.open_document(path)
         locations = await client.get_definition(path, line - 1, column - 1)
 
         if not locations:
-            return f"NO_DEFINITION: {path.name}:{line}:{column}"
+            return _not_found(f"No definition at {path.name}:{line}:{column}")
 
-        results = ["DEFINITION:"]
+        defs = []
         for loc in locations:
-            results.append(_format_location(loc))
+            def_path = _uri_to_path(loc.uri)
+            defs.append({
+                "file": def_path.name,
+                "path": str(def_path),
+                "line": loc.range.start.line + 1,
+                "column": loc.range.start.character + 1
+            })
 
-        return "\n".join(results)
+        return _ok({"definitions": defs})
     except Exception as e:
-        return f"ERROR: {e}"
+        return _error(str(e))
 
 
 @mcp.tool()
 async def find_usages(file_path: str, line: int, column: int) -> str:
-    """
-    Find all references to symbol at position across the project.
-
-    Args:
-        file_path: Absolute path to Python file.
-        line: Line number (1-based).
-        column: Column number (1-based).
-
-    Returns:
-        All reference locations.
-    """
+    """Find all references to symbol at position (1-based)."""
     client = _get_client()
 
     path = Path(file_path).resolve()
     if not path.exists():
-        return f"ERROR: File not found: {file_path}"
+        return _error(f"File not found: {file_path}")
 
     try:
         await client.open_document(path)
         locations = await client.find_references(path, line - 1, column - 1)
 
         if not locations:
-            return f"NO_REFERENCES: {path.name}:{line}:{column}"
+            return _not_found(f"No references at {path.name}:{line}:{column}")
 
-        by_file: dict[str, list[Location]] = {}
+        refs = []
         for loc in locations:
-            by_file.setdefault(loc.uri, []).append(loc)
+            ref_path = _uri_to_path(loc.uri)
+            refs.append({
+                "file": ref_path.name,
+                "path": str(ref_path),
+                "line": loc.range.start.line + 1,
+                "column": loc.range.start.character + 1
+            })
 
-        results = [f"REFERENCES: {len(locations)} in {len(by_file)} files", ""]
-        for uri, locs in by_file.items():
-            file_name = _uri_to_path(uri).name
-            for loc in locs:
-                results.append(
-                    f"{file_name}:{loc.range.start.line + 1}:{loc.range.start.character + 1}")
-
-        return "\n".join(results)
+        files = list(set(r["file"] for r in refs))
+        return _ok({"count": len(refs), "files_count": len(files), "references": refs})
     except Exception as e:
-        return f"ERROR: {e}"
+        return _error(str(e))
 
 
 @mcp.tool()
 async def get_type_info(file_path: str, line: int, column: int) -> str:
-    """
-    Get type information for symbol at position.
-
-    Args:
-        file_path: Absolute path to Python file.
-        line: Line number (1-based).
-        column: Column number (1-based).
-
-    Returns:
-        Type information.
-    """
+    """Get type information for symbol at position (1-based)."""
     client = _get_client()
 
     path = Path(file_path).resolve()
     if not path.exists():
-        return f"ERROR: File not found: {file_path}"
+        return _error(f"File not found: {file_path}")
 
     try:
         await client.open_document(path)
         hover_info = await client.get_hover(path, line - 1, column - 1)
 
         if not hover_info:
-            return f"NO_TYPE_INFO: {path.name}:{line}:{column}"
+            return _not_found(f"No type info at {path.name}:{line}:{column}")
 
-        return f"TYPE_INFO: {path.name}:{line}:{column}\n{hover_info}"
+        return _ok({
+            "file": path.name,
+            "line": line,
+            "column": column,
+            "type_info": hover_info
+        })
     except Exception as e:
-        return f"ERROR: {e}"
+        return _error(str(e))
 
 
 @mcp.tool()
 async def get_diagnostics(file_path: str) -> str:
-    """
-    Get type errors and warnings for a file.
-
-    Args:
-        file_path: Absolute path to Python file.
-
-    Returns:
-        List of diagnostics.
-    """
+    """Get type errors and warnings for a file."""
     client = _get_client()
 
     path = Path(file_path).resolve()
     if not path.exists():
-        return f"ERROR: File not found: {file_path}"
+        return _error(f"File not found: {file_path}")
 
     try:
         await client.open_document(path)
@@ -538,42 +450,38 @@ async def get_diagnostics(file_path: str) -> str:
         diagnostics = client.get_diagnostics(path)
 
         if not diagnostics:
-            return f"OK: No errors in {path.name}"
+            return _ok({"file": path.name, "count": 0, "diagnostics": []})
 
-        results = [f"DIAGNOSTICS: {len(diagnostics)} in {path.name}", ""]
+        diag_list = []
         for diag in diagnostics:
-            results.append(_format_diagnostic(diag))
+            severity = SEVERITY_MAP.get(diag.severity or 1, "error")
+            diag_list.append({
+                "line": diag.range.start.line + 1,
+                "column": diag.range.start.character + 1,
+                "severity": severity,
+                "message": diag.message
+            })
 
-        return "\n".join(results)
+        return _ok({"file": path.name, "count": len(diag_list), "diagnostics": diag_list})
     except Exception as e:
-        return f"ERROR: {e}"
+        return _error(str(e))
 
 
 @mcp.tool()
 async def get_completions(file_path: str, line: int, column: int) -> str:
-    """
-    Get code completion suggestions at position.
-
-    Args:
-        file_path: Absolute path to Python file.
-        line: Line number (1-based).
-        column: Column number (1-based).
-
-    Returns:
-        Completion items.
-    """
+    """Get code completion suggestions at position (1-based)."""
     client = _get_client()
 
     path = Path(file_path).resolve()
     if not path.exists():
-        return f"ERROR: File not found: {file_path}"
+        return _error(f"File not found: {file_path}")
 
     try:
         await client.open_document(path)
         completions = await client.get_completions(path, line - 1, column - 1)
 
         if not completions:
-            return f"NO_COMPLETIONS: {path.name}:{line}:{column}"
+            return _not_found(f"No completions at {path.name}:{line}:{column}")
 
         kind_names = {
             1: "text", 2: "method", 3: "function", 4: "constructor",
@@ -585,38 +493,34 @@ async def get_completions(file_path: str, line: int, column: int) -> str:
             25: "type_parameter"
         }
 
-        results = [f"COMPLETIONS: {len(completions)}", ""]
+        items = []
         for item in completions[:30]:
             label = item.get("label", "?")
-            kind = kind_names.get(item.get("kind", 0), "?")
+            kind = kind_names.get(item.get("kind", 0), "unknown")
             detail = item.get("detail", "")
-            detail_str = f" : {detail}" if detail else ""
-            results.append(f"{label} ({kind}){detail_str}")
+            items.append({
+                "label": label,
+                "kind": kind,
+                "detail": detail or None
+            })
 
-        if len(completions) > 30:
-            results.append(f"... +{len(completions) - 30} more")
-
-        return "\n".join(results)
+        return _ok({
+            "count": len(completions),
+            "shown": len(items),
+            "completions": items
+        })
     except Exception as e:
-        return f"ERROR: {e}"
+        return _error(str(e))
 
 
 @mcp.tool()
 async def analyze_file(file_path: str) -> str:
-    """
-    Analyze a Python file: get structure and type errors.
-
-    Args:
-        file_path: Absolute path to Python file.
-
-    Returns:
-        File info and diagnostics summary.
-    """
+    """Analyze a Python file: get structure and diagnostics summary."""
     client = _get_client()
 
     path = Path(file_path).resolve()
     if not path.exists():
-        return f"ERROR: File not found: {file_path}"
+        return _error(f"File not found: {file_path}")
 
     try:
         content = path.read_text(encoding="utf-8")
@@ -633,50 +537,40 @@ async def analyze_file(file_path: str) -> str:
         warnings = sum(1 for d in diagnostics if d.severity == 2)
         hints = len(diagnostics) - errors - warnings
 
-        results = [
-            f"FILE: {path.name}",
-            f"PATH: {path}",
-            f"LINES: {line_count}",
-            f"ERRORS: {errors}",
-            f"WARNINGS: {warnings}",
-            f"HINTS: {hints}",
-            ""
-        ]
+        issues = []
+        for diag in diagnostics[:15]:
+            severity = SEVERITY_MAP.get(diag.severity or 1, "error")
+            issues.append({
+                "line": diag.range.start.line + 1,
+                "column": diag.range.start.character + 1,
+                "severity": severity,
+                "message": diag.message
+            })
 
-        if diagnostics:
-            results.append("ISSUES:")
-            for diag in diagnostics[:15]:
-                results.append(_format_diagnostic(diag))
-            if len(diagnostics) > 15:
-                results.append(f"... +{len(diagnostics) - 15} more")
-
-        return "\n".join(results)
+        return _ok({
+            "file": path.name,
+            "path": str(path),
+            "lines": line_count,
+            "errors": errors,
+            "warnings": warnings,
+            "hints": hints,
+            "issues": issues,
+            "total_issues": len(diagnostics)
+        })
     except Exception as e:
-        return f"ERROR: {e}"
+        return _error(str(e))
 
 
 @mcp.tool()
 async def safe_rename(
     file_path: str, line: int, column: int, new_name: str, apply: bool = False
 ) -> str:
-    """
-    Rename symbol across project. Semantic rename using type analysis.
-
-    Args:
-        file_path: File containing the symbol.
-        line: Line number (1-based).
-        column: Column number (1-based).
-        new_name: New symbol name.
-        apply: If True, apply changes. If False, preview only.
-
-    Returns:
-        Preview or confirmation of changes.
-    """
+    """Rename symbol across project. Set apply=True to execute."""
     client = _get_client()
 
     path = Path(file_path).resolve()
     if not path.exists():
-        return f"ERROR: File not found: {file_path}"
+        return _error(f"File not found: {file_path}")
 
     try:
         await client.open_document(path)
@@ -686,14 +580,30 @@ async def safe_rename(
         )
 
         if not workspace_edit:
-            return f"CANNOT_RENAME: {path.name}:{line}:{column}"
+            return _not_found(f"Cannot rename at {path.name}:{line}:{column}")
 
         all_edits = workspace_edit.get_all_edits()
         total_edits = sum(len(e) for e in all_edits.values())
 
         if not apply:
-            preview_lines = _format_workspace_edit(workspace_edit)
-            return f"PREVIEW: {total_edits} edits in {len(all_edits)} files\napply=True to confirm\n\n" + "\n".join(preview_lines)
+            preview = []
+            for uri, edits in all_edits.items():
+                edit_path = _uri_to_path(uri)
+                for e in edits:
+                    text_preview = e.new_text[:80].replace("\n", "\\n") if e.new_text else "(delete)"
+                    preview.append({
+                        "file": edit_path.name,
+                        "line": e.range.start.line + 1,
+                        "column": e.range.start.character + 1,
+                        "new_text": text_preview
+                    })
+            return _ok({
+                "preview": True,
+                "new_name": new_name,
+                "edits_count": total_edits,
+                "files_count": len(all_edits),
+                "edits": preview
+            })
 
         applied_files = []
         for uri, edits in all_edits.items():
@@ -703,30 +613,24 @@ async def safe_rename(
                 file_to_edit.write_text(new_content, encoding="utf-8")
                 applied_files.append(file_to_edit.name)
 
-        return f"RENAMED: '{new_name}'\nMODIFIED: {', '.join(applied_files)}"
+        return _ok({
+            "applied": True,
+            "new_name": new_name,
+            "modified_files": applied_files
+        })
 
     except Exception as e:
-        return f"ERROR: {e}"
+        return _error(str(e))
 
 
 @mcp.tool()
 async def get_code_actions(file_path: str, line: int, column: int) -> str:
-    """
-    Get available quick fixes and refactorings at position.
-
-    Args:
-        file_path: Absolute path to Python file.
-        line: Line number (1-based).
-        column: Column number (1-based).
-
-    Returns:
-        List of available actions with indices.
-    """
+    """Get available quick fixes and refactorings at position (1-based)."""
     client = _get_client()
 
     path = Path(file_path).resolve()
     if not path.exists():
-        return f"ERROR: File not found: {file_path}"
+        return _error(f"File not found: {file_path}")
 
     try:
         await client.open_document(path)
@@ -745,45 +649,33 @@ async def get_code_actions(file_path: str, line: int, column: int) -> str:
         )
 
         if not actions:
-            return f"NO_ACTIONS: {path.name}:{line}:{column}"
+            return _not_found(f"No actions at {path.name}:{line}:{column}")
 
-        results = [f"ACTIONS: {len(actions)}", ""]
+        action_list = []
         for i, action in enumerate(actions, 1):
-            kind = f" [{action.kind}]" if action.kind else ""
-            has_edit = " (editable)" if action.edit else ""
-            results.append(f"{i}. {action.title}{kind}{has_edit}")
+            action_list.append({
+                "index": i,
+                "title": action.title,
+                "kind": action.kind or None,
+                "has_edit": action.edit is not None
+            })
 
-        results.append("")
-        results.append(
-            "Use apply_code_action(file, line, col, index) to apply")
-
-        return "\n".join(results)
+        return _ok({"count": len(actions), "actions": action_list})
 
     except Exception as e:
-        return f"ERROR: {e}"
+        return _error(str(e))
 
 
 @mcp.tool()
 async def apply_code_action(
     file_path: str, line: int, column: int, action_index: int
 ) -> str:
-    """
-    Apply a code action by index (from get_code_actions output).
-
-    Args:
-        file_path: Absolute path to Python file.
-        line: Line number (1-based).
-        column: Column number (1-based).
-        action_index: 1-based index of action to apply.
-
-    Returns:
-        Confirmation of applied changes.
-    """
+    """Apply a code action by index (from get_code_actions)."""
     client = _get_client()
 
     path = Path(file_path).resolve()
     if not path.exists():
-        return f"ERROR: File not found: {file_path}"
+        return _error(f"File not found: {file_path}")
 
     try:
         await client.open_document(path)
@@ -802,15 +694,15 @@ async def apply_code_action(
         )
 
         if not actions:
-            return f"NO_ACTIONS: {path.name}:{line}:{column}"
+            return _not_found(f"No actions at {path.name}:{line}:{column}")
 
         if action_index < 1 or action_index > len(actions):
-            return f"INVALID_INDEX: Choose 1-{len(actions)}"
+            return _error(f"Invalid index. Choose 1-{len(actions)}")
 
         action = actions[action_index - 1]
 
         if not action.edit:
-            return f"NO_EDIT: Action '{action.title}' has no edits"
+            return _error(f"Action '{action.title}' has no edits")
 
         all_edits = action.edit.get_all_edits()
         applied_files = []
@@ -822,33 +714,26 @@ async def apply_code_action(
                 file_to_edit.write_text(new_content, encoding="utf-8")
                 applied_files.append(file_to_edit.name)
 
-        return f"APPLIED: {action.title}\nMODIFIED: {', '.join(applied_files) if applied_files else 'none'}"
+        return _ok({
+            "applied": True,
+            "action": action.title,
+            "modified_files": applied_files
+        })
 
     except Exception as e:
-        return f"ERROR: {e}"
+        return _error(str(e))
 
 
 @mcp.tool()
 async def get_edit_preview(
     file_path: str, line: int, column: int, action_index: int
 ) -> str:
-    """
-    Preview changes a code action would make.
-
-    Args:
-        file_path: Absolute path to Python file.
-        line: Line number (1-based).
-        column: Column number (1-based).
-        action_index: 1-based index of action to preview.
-
-    Returns:
-        Preview of changes.
-    """
+    """Preview changes a code action would make."""
     client = _get_client()
 
     path = Path(file_path).resolve()
     if not path.exists():
-        return f"ERROR: File not found: {file_path}"
+        return _error(f"File not found: {file_path}")
 
     try:
         await client.open_document(path)
@@ -867,24 +752,40 @@ async def get_edit_preview(
         )
 
         if not actions:
-            return f"NO_ACTIONS: {path.name}:{line}:{column}"
+            return _not_found(f"No actions at {path.name}:{line}:{column}")
 
         if action_index < 1 or action_index > len(actions):
-            return f"INVALID_INDEX: Choose 1-{len(actions)}"
+            return _error(f"Invalid index. Choose 1-{len(actions)}")
 
         action = actions[action_index - 1]
 
         if not action.edit:
-            return f"NO_PREVIEW: Action '{action.title}' has no edits"
+            return _error(f"Action '{action.title}' has no edits")
 
-        preview_lines = _format_workspace_edit(action.edit)
         all_edits = action.edit.get_all_edits()
         total_edits = sum(len(e) for e in all_edits.values())
 
-        return f"PREVIEW: {action.title}\nEDITS: {total_edits} in {len(all_edits)} files\n\n" + "\n".join(preview_lines)
+        preview = []
+        for uri, edits in all_edits.items():
+            edit_path = _uri_to_path(uri)
+            for e in edits:
+                text_preview = e.new_text[:80].replace("\n", "\\n") if e.new_text else "(delete)"
+                preview.append({
+                    "file": edit_path.name,
+                    "line": e.range.start.line + 1,
+                    "column": e.range.start.character + 1,
+                    "new_text": text_preview
+                })
+
+        return _ok({
+            "action": action.title,
+            "edits_count": total_edits,
+            "files_count": len(all_edits),
+            "edits": preview
+        })
 
     except Exception as e:
-        return f"ERROR: {e}"
+        return _error(str(e))
 
 
 def run_server():
